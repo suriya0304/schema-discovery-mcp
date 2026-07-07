@@ -1,0 +1,61 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-app_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-delivery_tracker}
+      # Consumed only by db/init/03_readonly_role.sh at first boot, to create
+      # the mcp_reader role. Never read by the agent or mcp-server images.
+      MCP_READONLY_PASSWORD: ${MCP_READONLY_PASSWORD:?set MCP_READONLY_PASSWORD in .env}
+    volumes:
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-app_admin} -d ${POSTGRES_DB:-delivery_tracker}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [backend]
+
+  mcp-server:
+    build: ./mcp_server
+    environment:
+      PG_HOST: db
+      PG_PORT: "5432"
+      PG_DATABASE: ${POSTGRES_DB:-delivery_tracker}
+      # mcp_reader is a SELECT-only role created by db/init/03_readonly_role.sh.
+      # This is the *only* credential this container has, and the *only*
+      # credential that exists anywhere near the LLM-facing code.
+      PG_USER: mcp_reader
+      PG_PASSWORD: ${MCP_READONLY_PASSWORD:?set MCP_READONLY_PASSWORD in .env}
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "8000"
+      MAX_ROWS: "200"
+      STATEMENT_TIMEOUT_MS: "5000"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [backend]
+    # Not published to the host: only agent-api (on the same compose network)
+    # can reach this. Uncomment to poke it directly while developing:
+    # ports: ["8000:8000"]
+
+  agent-api:
+    build: ./agent
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY in .env}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      MCP_SERVER_URL: http://mcp-server:8000/mcp
+      AGENT_RECURSION_LIMIT: "24"
+    depends_on:
+      - mcp-server
+    ports:
+      - "8080:8080"
+    networks: [backend]
+
+networks:
+  backend:
+
+volumes:
+  pgdata:
